@@ -173,7 +173,44 @@ export function decodeEasystart(b) {
 // ---------------------------------------------------------------- Victron Instant Readout
 
 export const VICTRON_COMPANY = 0x02e1;
-const CHARGE = { 0: 'Off', 2: 'Fault', 3: 'Bulk', 4: 'Absorption', 5: 'Float', 6: 'Storage', 7: 'Equalize', 245: 'Starting', 252: 'External control' };
+const CHARGE = { 0: 'Off', 1: 'Low power', 2: 'Fault', 3: 'Bulk', 4: 'Absorption', 5: 'Float', 6: 'Storage', 7: 'Equalize', 11: 'Power supply',
+  245: 'Starting', 246: 'Repeated absorption', 247: 'Recondition', 248: 'Battery safe', 252: 'External control' };
+const ALARMS = ['low voltage', 'high voltage', 'low charge', 'low starter voltage', 'high starter voltage', 'low temperature', 'high temperature',
+  'midpoint voltage', 'overload', 'DC ripple', 'low AC voltage', 'high AC voltage', 'short circuit', 'BMS lockout'];
+const OFF_REASONS = [[0x1, 'no input power'], [0x2, 'switched off'], [0x4, 'switched off in settings'], [0x8, 'remote input'], [0x10, 'protection active'],
+  [0x20, 'out of credit'], [0x40, 'BMS'], [0x80, 'engine off'], [0x100, 'checking input voltage']];
+const offReasons = (mask) => {
+  const list = OFF_REASONS.filter(([bit]) => mask & bit).map(([, text]) => text);
+  return list.length || !mask ? list : [`code 0x${mask.toString(16)}`];
+};
+
+/** Names Victron products advertise. They need a key and broadcasts, not a connection. */
+export const looksVictron = (name) => /^(orion|smart ?solar|blue ?solar|smart ?shunt|bmv|blue ?smart|phoenix|smart ?(bms|lithium|battery)|lynx|multi|victron)/i.test(name || '');
+
+/** Which accessory a name belongs to, or null when the name is unfamiliar. */
+export function kindForName(name) {
+  for (const [kind, spec] of [['litime', LITIME], ['easytouch', EASYTOUCH], ['easystart', EASYSTART]]) {
+    if (spec.namePrefixes.some((p) => (name || '').startsWith(p))) return kind;
+  }
+  return null;
+}
+
+const isBuffer = (v) => v instanceof ArrayBuffer || ArrayBuffer.isView(v) || Array.isArray(v);
+function toBytes(v) {
+  if (v instanceof ArrayBuffer) return new Uint8Array(v);
+  if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  return Array.isArray(v) ? Uint8Array.from(v) : null;
+}
+/** Victron bytes from an advertisement. Browsers differ in how they hold manufacturer data, so several shapes are accepted. */
+export function victronBytes(md) {
+  if (!md) return null;
+  const prefixed = (b) => b?.[0] === 0xe1 && b[1] === 0x02; // company ID still in front
+  if (isBuffer(md)) { const b = toBytes(md); return prefixed(b) ? b.slice(2) : null; }
+  const keys = [String(VICTRON_COMPANY), '02e1', '2e1', '0x02e1', '0x2e1'];
+  const entries = typeof md.entries === 'function' ? [...md.entries()] : Object.entries(md);
+  const b = toBytes(entries.find(([k]) => keys.includes(String(k).toLowerCase()))?.[1]);
+  return prefixed(b) ? b.slice(2) : b;
+}
 
 export const normalizeKey = (k) => {
   const s = String(k).toLowerCase().replace(/[^0-9a-f]/g, '');
@@ -187,7 +224,7 @@ export async function decodeVictron(bytes, keyHex) {
   const key = fromHex(keyHex);
   if (bytes[7] !== key[0]) return null; // key check byte
   const type = bytes[4];
-  if (type !== 1 && type !== 2) return { kind: 'other', type };
+  if (![1, 2, 0x0f].includes(type)) return { kind: 'other', type };
   const plain = await aesCtrLE(key, u16(bytes, 5), bytes.slice(8));
   const bits = bitReader(plain);
   if (type === 1) {
@@ -198,12 +235,26 @@ export async function decodeVictron(bytes, keyHex) {
       yieldWh: y === 0xffff ? null : y * 10, watts: w === 0xffff ? null : w,
     };
   }
+  if (type === 0x0f) { // Orion XS, layout posted by Victron staff on their community forum
+    const state = bits(8), err = bits(8), ov = bits(16, true), oa = bits(16, true), iv = bits(16), ia = bits(16), off = bits(32);
+    const outV = ov === 0x7fff ? null : ov / 100, outA = oa === 0x7fff ? null : oa / 10;
+    return {
+      kind: 'orion', state: state === 0xff ? 'Unknown' : CHARGE[state] || `State ${state}`, error: err === 0xff ? null : err,
+      outV, outA, watts: outV === null || outA === null ? null : outV * outA,
+      inV: iv === 0xffff ? null : iv / 100, inA: ia === 0xffff ? null : ia / 10,
+      offReasons: off === 0xffffffff ? [] : offReasons(off),
+    };
+  }
   const mins = bits(16), v = bits(16, true), alarm = bits(16);
-  bits(16); bits(2);
+  const aux = bits(16), auxMode = bits(2);
   const ma = bits(22, true), used = bits(20), soc = bits(10);
   return {
     kind: 'shunt', minutesLeft: mins === 0xffff ? null : mins, voltage: v === 0x7fff ? null : v / 100, alarm,
-    current: ma === 0x1fffff ? null : ma / 1000,
+    alarms: ALARMS.filter((_, i) => alarm & (1 << i)),
+    current: ma === 0x1fffff || ma === -1 ? null : ma / 1000, // all ones means not available
+    starter: auxMode === 0 && aux !== 0x7fff ? s16([aux & 255, aux >> 8], 0) / 100 : null,
+    midpoint: auxMode === 1 && aux !== 0xffff ? aux / 100 : null,
+    tempC: auxMode === 2 && aux !== 0xffff ? aux / 100 - 273.15 : null,
     usedAh: used === 0xfffff ? null : used / 10, soc: soc === 0x3ff ? null : soc / 10,
   };
 }

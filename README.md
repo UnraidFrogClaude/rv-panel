@@ -1,15 +1,16 @@
 # RV Panel
 
 A single-page panel for an older iPad (iPadOS 16), opened in the Bluefy browser.
-It talks to the RV's equipment directly over Bluetooth. Experimental: tested against
-recorded data and simulated devices, not yet against real equipment.
+It talks to the RV's equipment directly over Bluetooth. Experimental: LiTime batteries and an
+EasyTouch have connected on a real iPad. Everything else is tested only with recorded data and simulated devices.
 
 | Equipment | Reads | Controls |
 |---|---|---|
 | LiTime battery | Charge, voltage, current, temperature, cells | None, on purpose |
 | EasyTouch thermostat | Temperature, mode, fan, setpoints | Mode, temperature (60-90 F), fan |
 | EasyStart | Current, start peak, faults | None, on purpose |
-| Victron solar charger or battery monitor | Instant Readout, if the browser can receive it | None, broadcasts are one-way |
+| Victron solar charger, battery monitor or Orion XS | Instant Readout, if the browser can receive it | None, broadcasts are one-way |
+| Weather | Forecast (Open-Meteo) and US alerts (National Weather Service) for a rounded location | Not applicable |
 | Starlink | Link to the dish's own page | None |
 
 ## First test at the RV
@@ -34,4 +35,5 @@ recorded data and simulated devices, not yet against real equipment.
 ## Credits
 Protocol details and test frames: aiobmsble (Apache-2.0), victron-ble, mbhewitt/easytouch,
 k3vmcd/ha-micro-air-easytouch, DerekSeaman/ESPHome-Micro-Air-EasyStart. The code here is written fresh.
+Weather data by Open-Meteo.com (CC BY 4.0) and the US National Weather Service.
 Not affiliated with LiTime, Micro-Air, Victron or Starlink.

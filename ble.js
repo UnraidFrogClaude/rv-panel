@@ -16,6 +16,21 @@ export function note(source, text) {
   if (log.length > 400) log.splice(0, log.length - 400);
 }
 
+/** Bluefy can reject with nothing, or with a plain string, so never assume an Error. */
+export function why(e) {
+  if (e === undefined || e === null) return 'the browser gave no reason';
+  if (typeof e === 'string') return e;
+  return e.message || e.name || (e.code !== undefined ? `code ${e.code}` : 'the browser gave no reason');
+}
+
+// Connections are opened one at a time across all accessories.
+let radio = Promise.resolve();
+function oneAtATime(job) {
+  const r = radio.then(job);
+  radio = r.catch(() => {});
+  return r;
+}
+
 async function write(ch, data) {
   const p = ch.properties || {};
   if (p.write && ch.writeValueWithResponse) return ch.writeValueWithResponse(data);
@@ -26,11 +41,12 @@ async function write(ch, data) {
 /** One connected accessory. Subclasses implement setup() and poll(). */
 class Accessory {
   constructor(device, onChange) {
-    Object.assign(this, { device, onChange, status: 'connecting', error: null, data: null, updatedAt: 0, stopped: false, attempts: 0 });
+    Object.assign(this, { device, onChange, status: 'connecting', error: null, data: null, updatedAt: 0, stopped: false, attempts: 0, restored: false, raw: 0 });
     this.name = device.name || this.constructor.label;
     this.key = `${this.kind}:${device.id}`;
     this.queue = Promise.resolve();
-    this.onDrop = () => { if (!this.stopped) { note(this.name, 'connection dropped'); this.lost('Connection lost'); } };
+    // While still connecting, the connect attempt itself reports the failure.
+    this.onDrop = () => { if (!this.stopped && this.status === 'connected') { note(this.name, 'connection dropped'); this.lost('Connection lost'); } };
     device.addEventListener('gattserverdisconnected', this.onDrop);
   }
   get kind() { return this.constructor.kind; }
@@ -42,25 +58,54 @@ class Accessory {
     return r;
   }
   async start() {
-    if (this.stopped) return;
+    if (this.stopped || this.starting) return;
+    this.starting = true;
     clearTimeout(this.timer);
     this.status = 'connecting'; this.onChange();
     try {
-      await this.run(async () => {
-        const server = await timeout(this.device.gatt.connect(), 20000, 'Connecting');
-        const service = await timeout(server.getPrimaryService(this.constructor.spec.service), 10000, 'Finding the service');
-        await timeout(this.setup(service), 15000, 'Setup');
-      });
+      await oneAtATime(() => this.run(() => this.open()));
+      this.starting = false;
       if (this.stopped) return;
-      this.status = 'connected'; this.error = null;
+      this.status = 'connected'; this.error = null; this.restored = false; this.raw = 0;
       note(this.name, 'connected');
       this.onChange();
       this.loop();
     } catch (e) {
-      note(this.name, `connect failed: ${e.message}`);
-      this.lost(e.message); // before drop(), so the real reason is not replaced by 'Connection lost'
-      this.drop();
+      this.starting = false;
+      if (this.stopped) return;
+      note(this.name, `connect failed: ${why(e)}`);
+      this.lost(this.restored ? `Could not reconnect by itself (${why(e)}). Tap Reconnect.` : why(e));
     }
+  }
+  /** Runs inside the connection queue, and cleans up after itself so the next attempt starts fresh. */
+  async open() {
+    if (this.stopped) throw new Error('Stopped');
+    const { gatt } = this.device;
+    try {
+      let server;
+      try { server = await timeout(gatt.connect(), this.restored ? 10000 : 20000, 'Connecting'); }
+      catch (e) {
+        if (!this.restored || !this.device.watchAdvertisements) throw e;
+        note(this.name, `direct connect failed (${why(e)}), listening for it first`);
+        await this.hear();
+        server = await timeout(gatt.connect(), 10000, 'Connecting');
+      }
+      if (this.stopped) throw new Error('Stopped');
+      const service = await timeout(server.getPrimaryService(this.constructor.spec.service), 10000, 'Finding the service');
+      await timeout(this.setup(service), 15000, 'Setup');
+      if (this.stopped) throw new Error('Stopped');
+    } catch (e) { this.drop(); throw e; }
+  }
+  /** Some browsers will only reopen a remembered device after hearing it broadcast. */
+  async hear() {
+    const abort = new AbortController();
+    let heard;
+    const broadcast = new Promise((r) => { heard = r; });
+    this.device.addEventListener('advertisementreceived', heard);
+    try {
+      await timeout(this.device.watchAdvertisements({ signal: abort.signal }), 5000, 'Listening');
+      await timeout(broadcast, 8000, 'Hearing the device');
+    } finally { abort.abort(); this.device.removeEventListener('advertisementreceived', heard); }
   }
   async loop() {
     clearTimeout(this.timer);
@@ -69,9 +114,10 @@ class Accessory {
       await this.run(() => timeout(this.poll(), 15000, 'Reading'));
       this.attempts = 0; this.error = null;
     } catch (e) {
-      note(this.name, `read failed: ${e.message}`);
-      this.error = e.message;
-      if (++this.attempts >= 3) { this.lost(e.message); this.drop(); return; }
+      if (this.stopped || this.status !== 'connected') return;
+      note(this.name, `read failed: ${why(e)}`);
+      this.error = why(e);
+      if (++this.attempts >= 3) { this.attempts = 0; this.lost(why(e)); this.drop(); return; }
     }
     if (this.stopped || this.status !== 'connected') return;
     this.onChange();
@@ -83,10 +129,13 @@ class Accessory {
     clearTimeout(this.timer);
     this.status = 'waiting'; this.error = msg;
     const delay = Math.min(60, 3 * 2 ** Math.min(this.retries = (this.retries || 0) + 1, 5)) * 1000;
-    this.timer = setTimeout(() => { this.status = 'connecting'; this.start(); }, delay);
+    this.timer = setTimeout(() => this.start(), delay);
     this.onChange();
   }
-  drop() { try { if (this.device.gatt.connected) this.device.gatt.disconnect(); } catch { /* already gone */ } }
+  // Always asks, even when the browser believes it is disconnected: that also cancels an attempt still in progress.
+  drop() { try { this.device.gatt.disconnect(); } catch { /* already gone */ } }
+  /** Raw bytes are logged only a few times per connection, so the log keeps its history. */
+  noteRaw(b) { if (this.raw++ < 3) note(this.name, `rx ${P.toHex(b)}`); }
   got(data) { this.data = data; this.updatedAt = Date.now(); this.retries = 0; this.onChange(); }
   stop() {
     this.stopped = true; this.status = 'off';
@@ -98,7 +147,7 @@ class Accessory {
   async listen(ch, handler) {
     if (this.ch && this.handler) this.ch.removeEventListener('characteristicvaluechanged', this.handler);
     this.ch = ch;
-    this.handler = (e) => { try { handler(bytesOf(e.target.value)); } catch (err) { note(this.name, `decode failed: ${err.message}`); } };
+    this.handler = (e) => { try { handler(bytesOf(e.target.value)); } catch (err) { note(this.name, `decode failed: ${why(err)}`); } };
     ch.addEventListener('characteristicvaluechanged', this.handler);
     await ch.startNotifications();
   }
@@ -112,7 +161,7 @@ export class Litime extends Accessory {
     const rx = await service.getCharacteristic(P.LITIME.notify);
     this.tx = await service.getCharacteristic(P.LITIME.write);
     await this.listen(rx, (b) => {
-      note(this.name, `rx ${P.toHex(b)}`);
+      this.noteRaw(b);
       for (const f of this.framer.push(b)) { this.got(P.decodeLitime(f)); this.arrived?.(); }
     });
   }
@@ -130,7 +179,7 @@ export class Easystart extends Accessory {
     const rx = await service.getCharacteristic(P.EASYSTART.notify);
     this.tx = await service.getCharacteristic(P.EASYSTART.write);
     await this.listen(rx, (b) => {
-      note(this.name, `rx ${P.toHex(b)}`);
+      this.noteRaw(b);
       const d = P.decodeEasystart(b);
       if (d) { this.got(d); this.arrived?.(); }
     });
@@ -162,7 +211,7 @@ export class Easytouch extends Accessory {
       await wait(250 * (i + 1));
       const b = bytesOf(await this.rx.readValue());
       try { return P.decodeEasytouch(new TextDecoder().decode(b)); }
-      catch (e) { last = e; note(this.name, `unreadable reply, ${b.length} bytes: ${e.message}`); }
+      catch (e) { last = e; note(this.name, `unreadable reply, ${b.length} bytes: ${why(e)}`); }
     }
     throw new Error('The thermostat gave no usable reply. Check your Micro-Air sign-in and close its app.', { cause: last });
   }
@@ -186,8 +235,8 @@ export class Easytouch extends Accessory {
         throw new Error('The thermostat did not report the change. Check it at the wall.');
       });
     } catch (e) {
-      mine.state = 'failed'; mine.error = e.message;
-      note(this.name, `change failed: ${e.message}`);
+      mine.state = 'failed'; mine.error = why(e);
+      note(this.name, `change failed: ${why(e)}`);
     }
     this.onChange();
     if (mine.state === 'confirmed') setTimeout(() => { if (this.command === mine) { this.command = null; this.onChange(); } }, 4000);
@@ -199,9 +248,9 @@ export const KINDS = { litime: Litime, easytouch: Easytouch, easystart: Easystar
 export const supported = () => Boolean(navigator.bluetooth?.requestDevice);
 
 /** Must be called from a tap. showAll is for accessories with an unexpected name. */
-export async function choose(kind, showAll = false) {
+export async function choose(kind, showAll = false, name = null) {
   const { spec } = KINDS[kind];
-  const opts = showAll ? { acceptAllDevices: true } : { filters: spec.namePrefixes.map((namePrefix) => ({ namePrefix })) };
+  const opts = name && P.kindForName(name) !== kind ? { filters: [{ name }] } : showAll ? { acceptAllDevices: true } : { filters: spec.namePrefixes.map((namePrefix) => ({ namePrefix })) };
   return navigator.bluetooth.requestDevice({ ...opts, optionalServices: [spec.service] });
 }
 
@@ -212,44 +261,80 @@ export async function remembered() {
 
 // ---------------------------------------------------------------- Victron (receive only)
 
+const METHODS = {
+  scan: () => Boolean(navigator.bluetooth?.requestLEScan),
+  bluefy: () => Boolean(navigator.bluetooth?.watchAdvertisements), // Bluefy's own, documented only in its release notes
+  watch: () => Boolean(globalThis.BluetoothDevice && 'watchAdvertisements' in BluetoothDevice.prototype),
+};
+const failedMethods = new Set(); // the next tap tries the next way
+
 export class VictronListener {
-  constructor(keys, onReading) { Object.assign(this, { keys, onReading, state: 'off', error: null, heard: 0 }); }
-  static method() {
-    const bt = navigator.bluetooth;
-    if (bt?.requestLEScan) return 'scan';
-    if (globalThis.BluetoothDevice && 'watchAdvertisements' in BluetoothDevice.prototype) return 'watch';
-    return null;
-  }
+  constructor(keys, onReading) { Object.assign(this, { keys, onReading, state: 'off', broadcasts: 0, heard: new Map(), shapes: 0 }); }
+  static method() { return Object.keys(METHODS).find((m) => METHODS[m]() && !failedMethods.has(m)) || null; }
   async start() {
     const how = VictronListener.method();
     if (!how) throw new Error('This browser cannot receive Victron broadcasts. Use Boardstrom for Victron.');
+    const bt = navigator.bluetooth;
     this.handler = (e) => this.receive(e);
-    if (how === 'scan') {
-      navigator.bluetooth.addEventListener('advertisementreceived', this.handler);
-      this.scan = await navigator.bluetooth.requestLEScan({ acceptAllAdvertisements: true, keepRepeatedDevices: true });
-    } else {
-      this.device = await navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalManufacturerData: [P.VICTRON_COMPANY] });
-      this.device.addEventListener('advertisementreceived', this.handler);
-      this.abort = new AbortController();
-      await this.device.watchAdvertisements({ signal: this.abort.signal });
+    try {
+      if (how === 'watch') {
+        this.device = await bt.requestDevice({ acceptAllDevices: true, optionalManufacturerData: [P.VICTRON_COMPANY] });
+        this.device.addEventListener('advertisementreceived', this.handler);
+        this.abort = new AbortController();
+        await this.device.watchAdvertisements({ signal: this.abort.signal });
+      } else {
+        const opts = { acceptAllAdvertisements: true, keepRepeatedDevices: true };
+        bt.addEventListener('advertisementreceived', this.handler);
+        const started = how === 'scan' ? bt.requestLEScan(opts) : bt.watchAdvertisements({ ...opts, acceptAllDevices: true });
+        this.scan = await Promise.race([started, wait(30000)]); // one that never answers may still deliver
+      }
+    } catch (e) {
+      if (e?.name !== 'NotFoundError' && e?.name !== 'AbortError') failedMethods.add(how);
+      note('Victron', `${how} failed: ${why(e)}`);
+      throw e;
     }
     this.state = 'listening';
     note('Victron', `listening (${how})`);
   }
   async receive(e) {
-    const dv = e.manufacturerData?.get?.(P.VICTRON_COMPANY);
-    if (!dv) return;
-    this.heard++;
+    this.broadcasts++;
+    const bytes = P.victronBytes(e.manufacturerData);
+    const name = e.device?.name || e.name || 'Victron device';
+    if (!bytes) {
+      if (P.looksVictron(name) && this.shapes++ < 3) note('Victron', `broadcast from ${name} without readable data: ${Object.prototype.toString.call(e.manufacturerData)}, keys ${Object.keys(e.manufacturerData || {}).slice(0, 5)}`);
+      return;
+    }
+    if (bytes[0] !== 0x10) return; // not a readout
+    if (this.heard.get(name) !== bytes[4]) { this.heard.set(name, bytes[4]); note('Victron', `heard ${name}, record type ${bytes[4]}, ${bytes.length} bytes`); }
     for (const k of this.keys()) {
       try {
-        const d = await P.decodeVictron(bytesOf(dv), k.key);
+        const d = await P.decodeVictron(bytes, k.key);
         if (d) { this.onReading(k, d); return; }
-      } catch (err) { note('Victron', `decode failed: ${err.message}`); }
+      } catch (err) { note('Victron', `decode failed: ${why(err)}`); }
     }
   }
   stop() {
-    navigator.bluetooth?.removeEventListener?.('advertisementreceived', this.handler);
-    this.device?.removeEventListener('advertisementreceived', this.handler);
-    this.scan?.stop?.(); this.abort?.abort(); this.state = 'off';
+    if (this.handler) {
+      navigator.bluetooth?.removeEventListener?.('advertisementreceived', this.handler);
+      this.device?.removeEventListener('advertisementreceived', this.handler);
+    }
+    try { this.scan?.stop?.(); } catch { /* already stopped */ }
+    this.abort?.abort(); this.state = 'off';
   }
+}
+
+/** What this browser offers. Bluefy's extras are undocumented, so the functions' own code is the only reference. */
+export function browserDetails() {
+  const bt = navigator.bluetooth;
+  const names = (o) => {
+    const s = new Set();
+    for (let p = o; p && p !== Object.prototype && p !== Function.prototype; p = Object.getPrototypeOf(p)) Object.getOwnPropertyNames(p).forEach((n) => s.add(n));
+    return [...s].join(', ') || 'empty';
+  };
+  const D = globalThis.BluetoothDevice?.prototype, G = globalThis.BluetoothRemoteGATTServer?.prototype;
+  const code = { watchAdvertisements: bt?.watchAdvertisements, requestLEScan: bt?.requestLEScan, getDevices: bt?.getDevices,
+    setScreenDimEnabled: bt?.setScreenDimEnabled, 'device.watchAdvertisements': D?.watchAdvertisements, 'gatt.connect': G?.connect };
+  return [`Browser: ${navigator.userAgent}`, `bluetooth: ${bt ? names(bt) : 'none'}`, `BLENative: ${globalThis.BLENative ? names(globalThis.BLENative) : 'none'}`,
+    `BluetoothDevice: ${D ? names(D) : 'none'}`, `GATT server: ${G ? names(G) : 'none'}`,
+    ...Object.entries(code).map(([k, f]) => `[${k}] ${typeof f === 'function' ? String(f).slice(0, 1500) : 'none'}`)].join('\n');
 }
