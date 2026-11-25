@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="RV Panel">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; form-action 'none'; base-uri 'none'">
+<title>RV Panel</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>RV Panel</h1>
+  <span id="clock"></span>
+  <span class="grow"></span>
+  <button id="lock" data-act="lock" aria-pressed="true"></button>
+  <button data-act="theme" id="theme"></button>
+  <button data-act="setup">Setup</button>
+</header>
+<div id="banner" hidden></div>
+<main>
+  <section id="power" aria-label="Power"></section>
+  <section id="climate" aria-label="Climate"></section>
+  <section id="other" aria-label="Other equipment"></section>
+</main>
+<dialog id="setup" aria-label="Setup"></dialog>
+<script type="module" src="app.js"></script>
+</body>
+</html>
