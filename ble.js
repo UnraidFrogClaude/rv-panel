@@ -263,68 +263,81 @@ export async function remembered() {
 
 const METHODS = {
   scan: () => Boolean(navigator.bluetooth?.requestLEScan),
-  bluefy: () => Boolean(navigator.bluetooth?.watchAdvertisements), // Bluefy's own, documented only in its release notes
-  watch: () => Boolean(globalThis.BluetoothDevice && 'watchAdvertisements' in BluetoothDevice.prototype),
+  bluefy: () => Boolean(navigator.bluetooth?.watchAdvertisements),
+  // Pick each Victron device once, then listen to it. Bluefy's devices can do this even though it has no global BluetoothDevice.
+  pick: () => Boolean(navigator.bluetooth?.requestDevice),
 };
 const failedMethods = new Set(); // the next tap tries the next way
+const VICTRON_PREFIXES = ['Orion', 'SmartSolar', 'Smart Solar', 'BlueSolar', 'SmartShunt', 'Smart Shunt', 'BMV', 'Blue Smart', 'Phoenix', 'SmartBMS', 'Smart BMS', 'SmartLithium', 'Lynx', 'Multi', 'Victron'];
 
 export class VictronListener {
-  constructor(keys, onReading) { Object.assign(this, { keys, onReading, state: 'off', broadcasts: 0, heard: new Map(), shapes: 0 }); }
+  constructor(keys, onReading) { Object.assign(this, { keys, onReading, state: 'off', how: null, broadcasts: 0, heard: new Map(), matched: new Set(), shapes: 0, devices: new Map() }); }
   static method() { return Object.keys(METHODS).find((m) => METHODS[m]() && !failedMethods.has(m)) || null; }
-  async start() {
-    const how = VictronListener.method();
+  /** From a tap. In pick mode each tap adds one device; showAll is for a renamed one. */
+  async start(showAll = false) {
+    const how = this.how || VictronListener.method();
     if (!how) throw new Error('This browser cannot receive Victron broadcasts. Use Boardstrom for Victron.');
     const bt = navigator.bluetooth;
-    this.handler = (e) => this.receive(e);
     try {
-      if (how === 'watch') {
-        this.device = await bt.requestDevice({ acceptAllDevices: true, optionalManufacturerData: [P.VICTRON_COMPANY] });
-        this.device.addEventListener('advertisementreceived', this.handler);
-        this.abort = new AbortController();
-        await this.device.watchAdvertisements({ signal: this.abort.signal });
+      if (how === 'pick') {
+        const opts = showAll ? { acceptAllDevices: true } : { filters: VICTRON_PREFIXES.map((namePrefix) => ({ namePrefix })) };
+        const d = await bt.requestDevice({ ...opts, optionalManufacturerData: [P.VICTRON_COMPANY] });
+        await this.watch(d);
       } else {
         const opts = { acceptAllAdvertisements: true, keepRepeatedDevices: true };
+        this.handler = (e) => this.receive(e);
         bt.addEventListener('advertisementreceived', this.handler);
         const started = how === 'scan' ? bt.requestLEScan(opts) : bt.watchAdvertisements({ ...opts, acceptAllDevices: true });
         this.scan = await Promise.race([started, wait(30000)]); // one that never answers may still deliver
       }
     } catch (e) {
-      if (e?.name !== 'NotFoundError' && e?.name !== 'AbortError') failedMethods.add(how);
+      if (e?.name !== 'NotFoundError' && e?.name !== 'AbortError' && !this.devices.size) failedMethods.add(how);
       note('Victron', `${how} failed: ${why(e)}`);
       throw e;
     }
-    this.state = 'listening';
+    this.how = how; this.state = 'listening';
     note('Victron', `listening (${how})`);
   }
-  async receive(e) {
+  /** Listens to one device's broadcasts. Needs no tap, so devices picked before resume after a reload. */
+  async watch(d) {
+    if (this.devices.has(d.id)) return;
+    if (typeof d.watchAdvertisements !== 'function') throw new Error('This browser cannot listen to Victron devices. Use Boardstrom for Victron.');
+    const abort = new AbortController(), h = (e) => this.receive(e, d);
+    d.addEventListener('advertisementreceived', h);
+    this.devices.set(d.id, { d, abort, h });
+    try { await timeout(d.watchAdvertisements({ signal: abort.signal }), 15000, 'Listening'); }
+    catch (e) { abort.abort(); d.removeEventListener('advertisementreceived', h); this.devices.delete(d.id); throw e; }
+    this.how = 'pick'; this.state = 'listening';
+    note('Victron', `listening to ${d.name || 'a device'}`);
+  }
+  async receive(e, d = null) {
     this.broadcasts++;
     const bytes = P.victronBytes(e.manufacturerData);
-    const name = e.device?.name || e.name || 'Victron device';
+    const name = e.device?.name || d?.name || e.name || 'Victron device';
     if (!bytes) {
-      if (P.looksVictron(name) && this.shapes++ < 3) note('Victron', `broadcast from ${name} without readable data: ${Object.prototype.toString.call(e.manufacturerData)}, keys ${Object.keys(e.manufacturerData || {}).slice(0, 5)}`);
+      if ((d || P.looksVictron(name)) && this.shapes++ < 3) note('Victron', `broadcast from ${name} without readable data: ${Object.prototype.toString.call(e.manufacturerData)}, keys ${Object.keys(e.manufacturerData || {}).slice(0, 5)}`);
       return;
     }
     if (bytes[0] !== 0x10) return; // not a readout
     if (this.heard.get(name) !== bytes[4]) { this.heard.set(name, bytes[4]); note('Victron', `heard ${name}, record type ${bytes[4]}, ${bytes.length} bytes`); }
     for (const k of this.keys()) {
       try {
-        const d = await P.decodeVictron(bytes, k.key);
-        if (d) { this.onReading(k, d); return; }
+        const r = await P.decodeVictron(bytes, k.key);
+        if (r) { this.matched.add(name); this.onReading(k, r); return; }
       } catch (err) { note('Victron', `decode failed: ${why(err)}`); }
     }
   }
   stop() {
-    if (this.handler) {
-      navigator.bluetooth?.removeEventListener?.('advertisementreceived', this.handler);
-      this.device?.removeEventListener('advertisementreceived', this.handler);
-    }
+    if (this.handler) navigator.bluetooth?.removeEventListener?.('advertisementreceived', this.handler);
+    for (const { d, abort, h } of this.devices.values()) { abort.abort(); d.removeEventListener('advertisementreceived', h); }
+    this.devices.clear();
     try { this.scan?.stop?.(); } catch { /* already stopped */ }
-    this.abort?.abort(); this.state = 'off';
+    this.state = 'off';
   }
 }
 
 /** What this browser offers. Bluefy's extras are undocumented, so the functions' own code is the only reference. */
-export function browserDetails() {
+export async function browserDetails() {
   const bt = navigator.bluetooth;
   const names = (o) => {
     const s = new Set();
@@ -332,9 +345,11 @@ export function browserDetails() {
     return [...s].join(', ') || 'empty';
   };
   const D = globalThis.BluetoothDevice?.prototype, G = globalThis.BluetoothRemoteGATTServer?.prototype;
-  const code = { watchAdvertisements: bt?.watchAdvertisements, requestLEScan: bt?.requestLEScan, getDevices: bt?.getDevices,
+  const dev = (await remembered())[0]; // only its property names and code are shown, not which device it is
+  const code = { 'remembered device.watchAdvertisements': dev?.watchAdvertisements, watchAdvertisements: bt?.watchAdvertisements, requestLEScan: bt?.requestLEScan, getDevices: bt?.getDevices,
     setScreenDimEnabled: bt?.setScreenDimEnabled, 'device.watchAdvertisements': D?.watchAdvertisements, 'gatt.connect': G?.connect };
   return [`Browser: ${navigator.userAgent}`, `bluetooth: ${bt ? names(bt) : 'none'}`, `BLENative: ${globalThis.BLENative ? names(globalThis.BLENative) : 'none'}`,
     `BluetoothDevice: ${D ? names(D) : 'none'}`, `GATT server: ${G ? names(G) : 'none'}`,
+    `remembered device: ${dev ? names(dev) : 'none'}`, `[BLENative.notifyAdvertisementReceived] ${String(globalThis.BLENative?.notifyAdvertisementReceived ?? 'none').slice(0, 1500)}`,
     ...Object.entries(code).map(([k, f]) => `[${k}] ${typeof f === 'function' ? String(f).slice(0, 1500) : 'none'}`)].join('\n');
 }

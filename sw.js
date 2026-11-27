@@ -1,5 +1,5 @@
 // Keeps a copy of the panel so it can open without internet. Bump VERSION on every release.
-const VERSION = 'rv-panel-2';
+const VERSION = 'rv-panel-3';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'ble.js', 'protocols.js', 'weather.js', 'manifest.webmanifest'];
 self.addEventListener('install', (e) => e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' })))).then(() => self.skipWaiting())));
 self.addEventListener('activate', (e) => e.waitUntil(caches.keys()

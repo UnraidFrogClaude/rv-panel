@@ -8,14 +8,14 @@ const num = (n, d = 1, unit = '') => (n === null || n === undefined || !Number.i
 const local = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const STALE_MS = 60000;
 const WEATHER_EVERY = 20 * 60000, WEATHER_STALE = 3 * 3600000;
-const VERSION = 2; // keep in step with sw.js
+const VERSION = 3; // keep in step with sw.js
 
 // ---- storage (best effort; the panel works without it)
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(`rv.${k}`)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { v === null ? localStorage.removeItem(`rv.${k}`) : localStorage.setItem(`rv.${k}`, JSON.stringify(v)); } catch { /* private mode */ } };
 
 const state = {
-  accessories: new Map(), victron: new Map(), listener: null, locked: true, demo: false,
+  accessories: new Map(), victron: new Map(), listener: null, vicIds: load('vic', []), locked: true, demo: false,
   keys: load('keys', []), known: load('known', {}), creds: load('creds', { email: '', password: '' }),
   remember: Boolean(load('creds', null)), pending: new Map(), message: '', offline: 'checking',
   place: load('place', null), wx: load('wx', null), wxBusy: false, wxError: '', placeError: '', found: [],
@@ -139,9 +139,13 @@ function weatherCard() {
 }
 
 function victronHint(l) {
-  const heard = [...l.heard.keys()].map(esc).join(', ');
+  const unmatched = [...l.heard.keys()].filter((n) => !l.matched.has(n));
+  if (l.heard.size && !unmatched.length) return `Listening to ${[...l.heard.keys()].map(esc).join(', ')}.`;
+  const heard = unmatched.map(esc).join(', ');
+  const watching = [...l.devices.values()].map((x) => esc(x.d.name || 'Victron device'));
+  if (!heard && watching.length) return `Listening to ${watching.join(', ')}. Nothing received yet. Readings arrive every few seconds when in range.`;
   if (!heard) return l.broadcasts ? 'Listening. Other Bluetooth devices are coming through, but nothing from Victron yet.' : 'Listening. No broadcasts received yet.';
-  if ([...l.heard.values()].every((t) => t === 0)) return `Listening. Heard ${heard}, but its Instant readout is off. Turn it on in VictronConnect.`;
+  if (unmatched.every((n) => l.heard.get(n) === 0)) return `Listening. Heard ${heard}, but its Instant readout is off. Turn it on in VictronConnect.`;
   return `Listening. Heard ${heard}. ${state.keys.length ? 'Your saved keys do not match it.' : 'Add its key under Setup to see the readings.'}`;
 }
 
@@ -156,11 +160,15 @@ function draw() {
   $('banner').textContent = banner;
 
   const bats = of('litime'), vics = [...state.victron.values()];
-  const listenBtn = canAdd() && !state.listener && VictronListener.method() ? '<div class="row"><button class="main" data-act="listen">Start listening</button></div>' : '';
+  const how = state.listener?.how || VictronListener.method();
+  const listenBtn = !canAdd() || !how || (state.listener && how !== 'pick') ? ''
+    : how !== 'pick' ? '<div class="row"><button class="main" data-act="listen">Start listening</button></div>'
+      : `<div class="row"><button class="main" data-act="listen">${state.listener?.devices.size ? 'Add another Victron device' : 'Pick Victron device'}</button><button data-act="listenall">Not listed? Show all</button></div>`;
+  const vicCard = !vics.length || listenBtn || state.listener?.devices.size;
   put('power', (bats.length ? bats.map(batteryCard).join('') : card('LiTime battery', `<p class="hint">Shows charge, power, temperature and cell balance.</p>${add('litime', 'Connect battery')}`))
     + vics.map(victronCard).join('')
-    + (!vics.length || listenBtn ? card('Victron', state.listener ? `<p class="hint">${victronHint(state.listener)}</p>`
-      : `<p class="hint">${!VictronListener.method() && !state.demo ? 'This browser has no Victron broadcast support. Use Boardstrom for Victron.' : state.keys.length ? 'Readings only.' : 'Readings only, for solar chargers, battery monitors and the Orion XS. Start listening to see what is in range, then add its key under Setup.'}</p>${listenBtn}`) : ''));
+    + (vicCard ? card('Victron', state.listener ? `<p class="hint">${victronHint(state.listener)}</p>${listenBtn}`
+      : `<p class="hint">${!VictronListener.method() && !state.demo ? 'This browser has no Victron broadcast support. Use Boardstrom for Victron.' : state.keys.length ? 'Readings only.' : how === 'pick' ? 'Readings only, for solar chargers, battery monitors and the Orion XS. Pick each one once, then add its key under Setup. The panel listens to them again after a reload.' : 'Readings only, for solar chargers, battery monitors and the Orion XS. Start listening to see what is in range, then add its key under Setup.'}</p>${listenBtn}`) : ''));
 
   const thermos = of('easytouch');
   put('climate', thermos.length ? thermos.map((a) => (a.data ? a.data.zones.map((z) => zoneCard(a, z, a.data.zones.length > 1)).join('') : card(a.name, '<p class="hint">Waiting for the first reading.</p>', a))).join('')
@@ -257,12 +265,31 @@ function step(id, field, delta) {
 function clearPending() { stepTimers.forEach(clearTimeout); stepTimers.clear(); state.pending.clear(); }
 
 // ---- Victron
-async function listen() {
-  const l = new VictronListener(() => state.keys, (k, data) => {
-    state.victron.set(k.key, { name: k.name, data, updatedAt: Date.now(), status: 'connected' });
-    refresh();
-  });
-  try { await l.start(); state.listener = l; } catch (e) { l.stop(); state.message = e?.name === 'NotFoundError' ? '' : `Could not listen for Victron: ${why(e)}${VictronListener.method() ? '. Tap Start listening to try another way.' : ''}`; }
+const newListener = () => new VictronListener(() => state.keys, (k, data) => {
+  state.victron.set(k.key, { name: k.name, data, updatedAt: Date.now(), status: 'connected' });
+  refresh();
+});
+function rememberVictron(l) {
+  state.vicIds = [...new Set([...state.vicIds, ...l.devices.keys()])]; save('vic', state.vicIds);
+}
+async function listen(showAll = false) {
+  const l = state.listener || newListener();
+  state.message = '';
+  try { await l.start(showAll); state.listener = l; rememberVictron(l); }
+  catch (e) {
+    if (l !== state.listener) l.stop();
+    if (e?.name !== 'NotFoundError') state.message = `Could not listen for Victron: ${why(e)}${!state.listener && VictronListener.method() ? '. Tap the Victron button to try another way.' : ''}`;
+  }
+  refresh();
+}
+/** Devices picked before. No tap needed; failures only go to the log. */
+async function resumeVictron(devices) {
+  if (!devices.length || VictronListener.method() !== 'pick') return;
+  const l = state.listener || newListener();
+  for (const d of devices) {
+    try { await l.watch(d); } catch (e) { note('Victron', `could not resume ${d.name || 'a device'}: ${why(e)}`); }
+  }
+  if (l.devices.size) state.listener = l;
   refresh();
 }
 
@@ -398,11 +425,11 @@ const actions = {
     setupMsg('Sign-in saved.');
   },
   forget() {
-    if (!confirm('Remove the saved sign-in, Victron keys, device list and weather place from this iPad?')) return;
-    ['creds', 'keys', 'known', 'log', 'place', 'wx'].forEach((k) => save(k, null));
+    if (!confirm('Remove the saved sign-in, Victron keys, device lists and weather place from this iPad?')) return;
+    ['creds', 'keys', 'known', 'log', 'place', 'wx', 'vic'].forEach((k) => save(k, null));
     log.length = 0; wxRun++; Object.assign(state, { place: null, wx: null, wxBusy: false, wxError: '', placeError: '', found: [] });
     state.creds = { email: '', password: '' }; state.keys = []; state.known = {}; state.remember = false;
-    state.listener?.stop(); state.listener = null; state.victron.clear();
+    state.listener?.stop(); state.listener = null; state.victron.clear(); state.vicIds = [];
     drawSetup();
   },
   addkey() {
@@ -410,13 +437,13 @@ const actions = {
       const key = P.normalizeKey($('vk').value);
       if (state.keys.some((k) => k.key === key)) throw new Error('That key is already saved');
       state.keys.push({ name: $('vn').value.trim() || `Victron ${state.keys.length + 1}`, key });
-      save('keys', state.keys); drawSetup(); setupMsg('Key added. Tap Done, then Start listening.');
+      save('keys', state.keys); drawSetup(); setupMsg('Key added. Readings appear once the device is being listened to.');
     } catch (e) { setupMsg(e.message); }
   },
   delkey(d) { const [k] = state.keys.splice(Number(d.i), 1); if (k) state.victron.delete(k.key); save('keys', state.keys); drawSetup(); },
   demo() { setDemo(!state.demo); $('setup').close(); },
   copylog() { return copy(`Panel version ${VERSION}\n${log.join('\n')}`); },
-  copybrowser() { return copy(browserDetails()); },
+  async copybrowser() { setupMsg('Collecting…'); return copy(await browserDetails()); },
   reconnect(d) { return reconnect(d.id); },
   here() { $('setup').close(); setPlace({ mode: 'here', name: 'Current location' }); },
   wxnow() { return updateWeather(); },
@@ -433,6 +460,7 @@ const actions = {
     $('setup').showModal();
   },
   listen() { return listen(); },
+  listenall() { return listen(true); },
   starlink() { window.open('http://192.168.100.1/', '_blank', 'noopener'); },
   mode(d) { clearPending(); return control(d.id, (z) => P.modeCommand(z.zone, d.v), MODE_LABEL[d.v]); },
   fan(d) { return control(d.id, (z) => P.fanCommand(z.zone, z.mode, d.v), `fan ${d.v}`); },
@@ -459,11 +487,14 @@ async function boot() {
   log.unshift(...load('log', [])); note('Panel', `opened, version ${VERSION}`);
   draw(); setInterval(draw, 5000); setInterval(saveLog, 10000); setInterval(weatherDue, 60000); keepAwake(); weatherDue();
   if (supported()) {
+    const victron = [];
     for (const d of await remembered()) {
-      if (!Object.hasOwn(KINDS, state.known[d.id] ?? '')) continue;
-      if (P.looksVictron(d.name)) { delete state.known[d.id]; save('known', state.known); } // picked by mistake before
-      else attach(P.kindForName(d.name) || state.known[d.id], d, true);
+      if (P.looksVictron(d.name) || state.vicIds.includes(d.id)) {
+        if (state.known[d.id]) { delete state.known[d.id]; save('known', state.known); } // picked by mistake as a battery before
+        victron.push(d);
+      } else if (Object.hasOwn(KINDS, state.known[d.id] ?? '')) attach(P.kindForName(d.name) || state.known[d.id], d, true);
     }
+    resumeVictron(victron);
   }
   if (!('serviceWorker' in navigator)) state.offline = 'not supported here';
   else if (local) state.offline = 'off while testing';

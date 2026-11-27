@@ -18,8 +18,9 @@ class Ch extends EventTarget {
   async op(f) { if (++sim.busy > 1) sim.overlap++; await new Promise((r) => setTimeout(r, 20)); sim.busy--; f(); }
 }
 class Dev extends EventTarget {
+  async watchAdvertisements({ signal } = {}) { this.watching = true; signal?.addEventListener('abort', () => { this.watching = false; }); }
   constructor(id, name, service, chars) {
-    super(); this.id = id; this.name = name;
+    super(); this.id = id; this.name = name; this.watching = false;
     const self = this;
     this.gatt = {
       connected: false,
@@ -29,6 +30,7 @@ class Dev extends EventTarget {
   }
 }
 sim.devices.orion = new Dev('o1', 'Orion XS SIM', 'none', {});
+sim.devices.shunt = new Dev('s1', 'SmartShunt SIM', 'none', {});
 const rx = new Ch({ notify: true });
 sim.devices.litime = new Dev('b1', 'L-12230-SIM', LITIME.service, { [LITIME.notify]: rx, [LITIME.write]: new Ch({ write: true }, (b) => {
   if (String(b) === String(LITIME.statusRequest)) { rx.emit(FRAME.slice(0, 60)); rx.emit(FRAME.slice(60)); }
@@ -63,12 +65,18 @@ class Bt extends EventTarget {
     return d;
   }
   // ?stale: remembered devices refuse to connect and give no reason, as Bluefy did after a reload.
-  async getDevices() { return Object.values(sim.devices); }
+  async getDevices() { return q.has('fresh') ? [] : Object.values(sim.devices); }
   async requestLEScan() { return { stop() {} }; }
 }
 const q = new URLSearchParams(location.search);
 if (q.has('stale')) ['b1', 't1', 'e1', 'o1'].forEach((i) => sim.stale.add(i));
 if (q.has('mustHear')) for (const d of Object.values(sim.devices)) { sim.mustHear.add(d.id); d.watchAdvertisements = async () => { setTimeout(() => { sim.mustHear.delete(d.id); d.dispatchEvent(new Event('advertisementreceived')); }, 100); }; }
 const bt = new Bt();
+// ?bluefy: no scanning and no global watch, only per-device listening, like Bluefy 3.9.3.
+if (q.has('bluefy')) bt.requestLEScan = undefined;
 Object.defineProperty(navigator, 'bluetooth', { value: bt, configurable: true });
-sim.advertise = (hex) => { const e = new Event('advertisementreceived'); e.device = { name: 'Orion XS SIM' }; e.manufacturerData = new Map([[0x02e1, dv(fromHex(hex))]]); bt.dispatchEvent(e); };
+sim.advertise = (hex, key = 'orion') => {
+  const d = sim.devices[key], e = new Event('advertisementreceived');
+  e.device = d; e.manufacturerData = new Map([[0x02e1, dv(fromHex(hex))]]);
+  if (q.has('bluefy')) { if (d.watching) d.dispatchEvent(e); } else bt.dispatchEvent(e);
+};
