@@ -185,7 +185,7 @@ const offReasons = (mask) => {
 };
 
 /** Names Victron products advertise. They need a key and broadcasts, not a connection. */
-export const looksVictron = (name) => /^(orion|smart ?solar|blue ?solar|smart ?shunt|bmv|blue ?smart|phoenix|smart ?(bms|lithium|battery)|lynx|multi|victron)/i.test(name || '');
+export const looksVictron = (name) => /^(orion|smart ?solar|blue ?solar|smart ?shunt|bmv|blue ?smart|phoenix|smart ?(bms|bmv|lithium|battery)|lynx|multi|victron)/i.test(name || '');
 
 /** Which accessory a name belongs to, or null when the name is unfamiliar. */
 export function kindForName(name) {

@@ -268,7 +268,7 @@ const METHODS = {
   pick: () => Boolean(navigator.bluetooth?.requestDevice),
 };
 const failedMethods = new Set(); // the next tap tries the next way
-const VICTRON_PREFIXES = ['Orion', 'SmartSolar', 'Smart Solar', 'BlueSolar', 'SmartShunt', 'Smart Shunt', 'BMV', 'Blue Smart', 'Phoenix', 'SmartBMS', 'Smart BMS', 'SmartLithium', 'Lynx', 'Multi', 'Victron'];
+const VICTRON_PREFIXES = ['Orion', 'SmartSolar', 'Smart Solar', 'BlueSolar', 'SmartShunt', 'Smart Shunt', 'BMV', 'SmartBMV', 'Smart BMV', 'Blue Smart', 'Phoenix', 'SmartBMS', 'Smart BMS', 'SmartLithium', 'Lynx', 'Multi', 'Victron'];
 
 export class VictronListener {
   constructor(keys, onReading) { Object.assign(this, { keys, onReading, state: 'off', how: null, broadcasts: 0, heard: new Map(), matched: new Set(), shapes: 0, devices: new Map() }); }

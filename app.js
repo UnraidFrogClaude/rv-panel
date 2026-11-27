@@ -8,7 +8,7 @@ const num = (n, d = 1, unit = '') => (n === null || n === undefined || !Number.i
 const local = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const STALE_MS = 60000;
 const WEATHER_EVERY = 20 * 60000, WEATHER_STALE = 3 * 3600000;
-const VERSION = 3; // keep in step with sw.js
+const VERSION = 4; // keep in step with sw.js
 
 // ---- storage (best effort; the panel works without it)
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(`rv.${k}`)) ?? d; } catch { return d; } };

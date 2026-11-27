@@ -160,7 +160,7 @@ test('Victron: broadcast data is accepted in every shape a browser might use', (
   for (const md of [null, undefined, new Map(), {}, new Map([[0x004c, dv]]), b, { 737: 'text' }]) assert.equal(P.victronBytes(md), null);
 });
 test('Names route to the right equipment', () => {
-  assert.equal(P.looksVictron('Orion XS HQ0000TEST'), true); assert.equal(P.looksVictron('SmartSolar HQ1'), true);
+  assert.equal(P.looksVictron('Orion XS HQ0000TEST'), true); assert.equal(P.looksVictron('SmartSolar HQ1'), true); assert.equal(P.looksVictron('SmartBMV HQ0000TEST'), true);
   for (const n of ['L-12320BH000-00001', 'EasyTouch 350000001', 'EasyStart_1', '', undefined]) assert.equal(P.looksVictron(n), false);
   assert.equal(P.kindForName('L-12320BH000-00001'), 'litime'); assert.equal(P.kindForName('EasyTouch 350000001'), 'easytouch');
   assert.equal(P.kindForName('Orion XS'), null); assert.equal(P.kindForName(undefined), null);
